@@ -1,6 +1,12 @@
-from legged_gym import LEGGED_GYM_ROOT_DIR
+import os
+from pathlib import Path
 import numpy as np
 import yaml
+
+LEGGED_GYM_ROOT_DIR = os.environ.get(
+    "LEGGED_GYM_ROOT_DIR",
+    str(Path(__file__).resolve().parents[2]),
+)
 
 
 class Config:

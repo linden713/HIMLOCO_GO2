@@ -32,7 +32,7 @@ from .base_config import BaseConfig
 
 class LeggedRobotCfg(BaseConfig):
     class env:
-        num_envs = 4096
+        num_envs = 3072#4096
         num_one_step_observations = 45
         num_observations = num_one_step_observations * 6
         num_one_step_privileged_obs = 45 + 3 + 3 + 187 # additional: base_lin_vel, external_forces, scan_dots
@@ -166,7 +166,7 @@ class LeggedRobotCfg(BaseConfig):
             tracking_ang_vel = 0.5
             lin_vel_z = -2.0
             ang_vel_xy = -0.05
-            orientation = -0.
+            orientation = -0.5
             torques = -0.00001
             dof_vel = -0.
             dof_acc = -2.5e-7

@@ -1,10 +1,9 @@
-from legged_gym import LEGGED_GYM_ROOT_DIR
+import os
+from pathlib import Path
 from typing import Union
 import numpy as np
 import time
-import torch
-import torch.nn.functional as F
-import logging
+import onnxruntime as ort
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelFactoryInitialize
 from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
@@ -23,27 +22,48 @@ from common.rotation_helper import get_gravity_orientation, transform_imu_data
 from common.remote_controller import RemoteController, KeyMap
 from config import Config
 
+LEGGED_GYM_ROOT_DIR = os.environ.get(
+    "LEGGED_GYM_ROOT_DIR",
+    str(Path(__file__).resolve().parents[2]),
+)
+
+
+class OnnxPolicy:
+    """Wrapper around the exported estimator+actor ONNX module (normalization handled inside)."""
+    def __init__(self, policy_path: str):
+        preferred = ['CUDAExecutionProvider', 'ROCMExecutionProvider', 'CPUExecutionProvider']
+        available = ort.get_available_providers()
+        providers = [p for p in preferred if p in available]
+        if not providers:
+            providers = available
+        self.session = ort.InferenceSession(policy_path, providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+
+    def __call__(self, obs_history: np.ndarray) -> np.ndarray:
+        if obs_history.ndim == 1:
+            obs_history = obs_history[None, :]
+        outputs = self.session.run([self.output_name], {self.input_name: obs_history.astype(np.float32)})
+        return outputs[0]
+
 
 class Controller:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.remote_controller = RemoteController()
 
-        # 加载actor和encoder
-        self.policy = torch.jit.load(config.policy_path)
-        # 分离出actor和encoder
-        self.actor = self.policy.actor
-        self.encoder = self.policy.estimator
+        # Load ONNX policy
+        self.policy = OnnxPolicy(self.config.policy_path)
 
         # Initializing process variables
-        self.qj = np.zeros(config.num_actions, dtype=np.float32)
-        self.dqj = np.zeros(config.num_actions, dtype=np.float32)
-        self.action = np.zeros(config.num_actions, dtype=np.float32)
-        self.target_dof_pos = config.default_angles.copy()
+        self.qj = np.zeros(self.config.num_actions, dtype=np.float32)
+        self.dqj = np.zeros(self.config.num_actions, dtype=np.float32)
+        self.action = np.zeros(self.config.num_actions, dtype=np.float32)
+        self.target_dof_pos = self.config.default_angles.copy()
         
-        self.current_obs = np.zeros(config.num_obs_current, dtype=np.float32)
-        self.obs_encoder = np.zeros(config.num_obs_encoder, dtype=np.float32) # 编码器网络输入
-        self.obs = np.zeros(config.num_obs, dtype=np.float32) # 策略网络输入
+        self.current_obs = np.zeros(self.config.num_obs_current, dtype=np.float32)
+        self.obs_encoder = np.zeros(self.config.num_obs_encoder, dtype=np.float32) # 编码器网络输入
+        self.obs = np.zeros(self.config.num_obs, dtype=np.float32) # 策略网络输入
         self.sc = SportClient()  
         self.sc.SetTimeout(5.0)
         self.sc.Init()
@@ -54,27 +74,27 @@ class Controller:
         self.cmd = np.array([0.0, 0, 0])
         self.counter = 0
 
-        if config.msg_type == "hg":
+        if self.config.msg_type == "hg":
             # g1 and h1_2 use the hg msg type
             self.low_cmd = unitree_hg_msg_dds__LowCmd_()
             self.low_state = unitree_hg_msg_dds__LowState_()
             self.mode_pr_ = MotorMode.PR
             self.mode_machine_ = 0
 
-            self.lowcmd_publisher_ = ChannelPublisher(config.lowcmd_topic, LowCmdHG)
+            self.lowcmd_publisher_ = ChannelPublisher(self.config.lowcmd_topic, LowCmdHG)
             self.lowcmd_publisher_.Init()
 
-            self.lowstate_subscriber = ChannelSubscriber(config.lowstate_topic, LowStateHG)
+            self.lowstate_subscriber = ChannelSubscriber(self.config.lowstate_topic, LowStateHG)
             self.lowstate_subscriber.Init(self.LowStateHgHandler, 10)
 
-        elif config.msg_type == "go":
+        elif self.config.msg_type == "go":
             self.low_cmd = unitree_go_msg_dds__LowCmd_()
             self.low_state = unitree_go_msg_dds__LowState_()
 
-            self.lowcmd_publisher_ = ChannelPublisher(config.lowcmd_topic, LowCmdGo)
+            self.lowcmd_publisher_ = ChannelPublisher(self.config.lowcmd_topic, LowCmdGo)
             self.lowcmd_publisher_.Init()
 
-            self.lowstate_subscriber = ChannelSubscriber(config.lowstate_topic, LowStateGo)
+            self.lowstate_subscriber = ChannelSubscriber(self.config.lowstate_topic, LowStateGo)
             self.lowstate_subscriber.Init(self.LowStateGoHandler, 10)
 
         else:
@@ -84,9 +104,9 @@ class Controller:
         self.wait_for_low_state()
 
         # Initialize the command msg
-        if config.msg_type == "hg":
+        if self.config.msg_type == "hg":
             init_cmd_hg(self.low_cmd, self.mode_machine_, self.mode_pr_)
-        elif config.msg_type == "go":
+        elif self.config.msg_type == "go":
             init_cmd_go(self.low_cmd, weak_motor=self.config.weak_motor)
 
     def LowStateHgHandler(self, msg: LowStateHG):
@@ -118,12 +138,15 @@ class Controller:
         print("Successfully shut down the operation control service.")
 
     def zero_torque_state(self):
-        print("Enter zero torque state.")
-        print("Waiting for the start signal...")
-        while self.remote_controller.button[KeyMap.start] != 1:
-            create_zero_cmd(self.low_cmd)
+        print("Enter damping state. Press START to continue.")
+        while True:
+            create_damping_cmd(self.low_cmd)
             self.send_cmd(self.low_cmd)
             time.sleep(self.config.control_dt)
+
+            if self.remote_controller.button[KeyMap.start] == 1:
+                print("Start pressed. Leaving damping state.")
+                break
 
     def move_to_default_pos(self):
         print("Moving to default pos.")
@@ -188,14 +211,8 @@ class Controller:
         self.current_obs[9 : 9 + num_actions] = qj_obs
         self.current_obs[9 + num_actions : 9 + num_actions * 2] = dqj_obs
         self.current_obs[9 + num_actions * 2 : 9 + num_actions * 3] = self.action
-        self.obs_encoder = np.concatenate((self.current_obs[:config.num_obs_current], self.obs_encoder[:-config.num_obs_current]),axis=-1)
-        obs_encoder_tensor = torch.from_numpy(self.obs_encoder.copy()).unsqueeze(0)
-        predict_tensor = self.encoder(obs_encoder_tensor)
-        vel_tensor, latent_tensor = predict_tensor[..., :3], predict_tensor[..., 3:]
-        latent_tensor = F.normalize(latent_tensor, dim=-1, p=2)
-
-        obs_tensor = torch.cat((obs_encoder_tensor[:,:config.num_obs_current], vel_tensor, latent_tensor), dim=-1)
-        self.action = self.actor(obs_tensor).detach().numpy().squeeze()
+        self.obs_encoder = np.concatenate((self.current_obs[:self.config.num_obs_current], self.obs_encoder[:-self.config.num_obs_current]), axis=-1)
+        self.action = self.policy(self.obs_encoder).astype(np.float32).squeeze()
         
         target_dof_pos = self.config.default_angles + self.action * self.config.action_scale
 
@@ -233,21 +250,30 @@ if __name__ == "__main__":
 
     controller.shut_down_control_service()
 
-    # Enter the zero torque state, press the start key to continue executing
-    controller.zero_torque_state()
+    state = "DAMPING"
+    running = True
 
-    # Move to the default position
-    controller.move_to_default_pos()
+    while running:
+        if state == "DAMPING":
+            controller.zero_torque_state()
+            state = "MOVE_TO_DEFAULT"
 
-    while True:
-        try:
-            controller.run()
-            # Press the select key to exit
-            if controller.remote_controller.button[KeyMap.select] == 1:
-                break
-        except KeyboardInterrupt:
-            break
-    # Enter the damping state
-    create_damping_cmd(controller.low_cmd)
-    controller.send_cmd(controller.low_cmd)
+        elif state == "MOVE_TO_DEFAULT":
+            controller.move_to_default_pos()
+            state = "RUNNING"
+
+        elif state == "RUNNING":
+            try:
+                controller.run()
+                if controller.remote_controller.button[KeyMap.select] == 1:
+                    state = "DAMPING"
+            except KeyboardInterrupt:
+                state = "SHUTDOWN"
+
+        elif state == "SHUTDOWN":
+            print("Entering damping mode.")
+            create_damping_cmd(controller.low_cmd)
+            controller.send_cmd(controller.low_cmd)
+            running = False
+
     print("Exit")

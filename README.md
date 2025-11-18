@@ -26,8 +26,9 @@
    - cd legged_gym/legged_gym/scripts
    - python play.py
 - Deploy
+   - pip install -e legged_gym/deploy
    - cd legged_gym/deploy/deploy_real
-   - python deploy_real_go2.py <网卡名称> go2.ymal
+   - python deploy_real_go2.py enp57s0 go2.ymal
 5.	Demo演示
 
 - 观看项目演示视频：[点击这里](https://www.bilibili.com/video/BV1CSXNYbEn4/?spm_id_from=333.1387.upload.video_card.click&vd_source=032f2f8aec6b50da9d8cb77f6a494111)
