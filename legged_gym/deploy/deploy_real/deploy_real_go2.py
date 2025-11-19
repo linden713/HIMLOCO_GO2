@@ -13,6 +13,8 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_ as LowCmdHG
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_ as LowCmdGo
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ as LowStateHG
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_ as LowStateGo
+from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
+from unitree_sdk2py.idl.default import std_msgs_msg_dds__String_
 from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
 from unitree_sdk2py.go2.sport.sport_client import SportClient
@@ -31,7 +33,7 @@ LEGGED_GYM_ROOT_DIR = os.environ.get(
 class OnnxPolicy:
     """Wrapper around the exported estimator+actor ONNX module (normalization handled inside)."""
     def __init__(self, policy_path: str):
-        preferred = ['CUDAExecutionProvider', 'ROCMExecutionProvider', 'CPUExecutionProvider']
+        preferred = ['CPUExecutionProvider','CUDAExecutionProvider', 'ROCMExecutionProvider']
         available = ort.get_available_providers()
         providers = [p for p in preferred if p in available]
         if not providers:
@@ -94,6 +96,10 @@ class Controller:
             self.lowcmd_publisher_ = ChannelPublisher(self.config.lowcmd_topic, LowCmdGo)
             self.lowcmd_publisher_.Init()
 
+            self.switch_publisher = ChannelPublisher("rt/utlidar/switch", String_)
+            self.switch_publisher.Init()
+            self.switch_low_cmd = std_msgs_msg_dds__String_()   
+
             self.lowstate_subscriber = ChannelSubscriber(self.config.lowstate_topic, LowStateGo)
             self.lowstate_subscriber.Init(self.LowStateGoHandler, 10)
 
@@ -108,6 +114,14 @@ class Controller:
             init_cmd_hg(self.low_cmd, self.mode_machine_, self.mode_pr_)
         elif self.config.msg_type == "go":
             init_cmd_go(self.low_cmd, weak_motor=self.config.weak_motor)
+
+    def go2_utlidar_switch(self,status):
+        if status == "OFF":
+            self.switch_low_cmd.data = "OFF"
+        elif status == "ON":
+            self.switch_low_cmd.data = "ON"
+
+        self.switch_publisher.Write(self.switch_low_cmd)
 
     def LowStateHgHandler(self, msg: LowStateHG):
         self.low_state = msg
@@ -249,6 +263,7 @@ if __name__ == "__main__":
     controller = Controller(config)
 
     controller.shut_down_control_service()
+    controller.go2_utlidar_switch("OFF")
 
     state = "DAMPING"
     running = True
@@ -267,6 +282,8 @@ if __name__ == "__main__":
                 controller.run()
                 if controller.remote_controller.button[KeyMap.select] == 1:
                     state = "DAMPING"
+                if controller.remote_controller.button[KeyMap.X] == 1:
+                    state = "SHUTDOWN"
             except KeyboardInterrupt:
                 state = "SHUTDOWN"
 
